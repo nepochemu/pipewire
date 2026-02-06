@@ -92,11 +92,32 @@ def list_endpoints() -> List[Dict[str, str]]:
     return merged
 
 
+def resolve_tailscale_host(name: str) -> Optional[str]:
+    if shutil.which("tailscale") is None:
+        return None
+    try:
+        out = run(["tailscale", "status", "--json"], check=False)
+        data = json.loads(out)
+        for peer in data.get("Peer", {}).values():
+            if peer.get("HostName") == name or peer.get("DNSName", "").split(".")[0] == name:
+                for ip in peer.get("TailscaleIPs", []):
+                    if ip.count(".") == 3:
+                        return ip
+    except Exception:
+        return None
+    return None
+
+
 def find_endpoint(query: str, endpoints: List[Dict[str, str]]) -> Dict[str, str]:
     # Direct host:port
     if ":" in query and re.match(r"^[^:]+:\d+$", query):
         host, port = query.split(":", 1)
         return {"name": host, "host": host, "port": port}
+
+    # Try Tailscale hostname fallback
+    ts_ip = resolve_tailscale_host(query)
+    if ts_ip:
+        return {"name": query, "host": ts_ip, "port": "4713"}
 
     # Try mDNS-style hostname fallback
     if "." not in query:

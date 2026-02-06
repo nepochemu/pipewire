@@ -118,7 +118,13 @@ def pactl_list_modules() -> str:
     return run(["pactl", "list", "modules"], check=False)
 
 
-def load_tunnel_sink(endpoint: Dict[str, str], fmt: Optional[str], rate: Optional[int], channels: Optional[int]) -> int:
+def load_tunnel_sink(
+    endpoint: Dict[str, str],
+    fmt: Optional[str],
+    rate: Optional[int],
+    channels: Optional[int],
+    latency_ms: Optional[int],
+) -> int:
     require_tool("pactl")
     sink_name = f"pwlink_{sanitize_name(endpoint['name'])}"
     args = [
@@ -134,6 +140,8 @@ def load_tunnel_sink(endpoint: Dict[str, str], fmt: Optional[str], rate: Optiona
         args.append(f"rate={rate}")
     if channels:
         args.append(f"channels={channels}")
+    if latency_ms:
+        args.append(f"latency_msec={latency_ms}")
     out = run(args)
     try:
         return int(out.strip())
@@ -187,7 +195,13 @@ def cmd_list() -> int:
     return 0
 
 
-def cmd_connect(target: Optional[str], fmt: Optional[str], rate: Optional[int], channels: Optional[int]) -> int:
+def cmd_connect(
+    target: Optional[str],
+    fmt: Optional[str],
+    rate: Optional[int],
+    channels: Optional[int],
+    latency_ms: Optional[int],
+) -> int:
     require_tool("pactl")
     eps = list_endpoints()
     cfg = load_config()
@@ -208,10 +222,11 @@ def cmd_connect(target: Optional[str], fmt: Optional[str], rate: Optional[int], 
     fmt = fmt or cfg.get("format")
     rate = rate or cfg.get("rate")
     channels = channels or cfg.get("channels")
+    latency_ms = latency_ms or cfg.get("latency_ms")
 
     sink_name = f"pwlink_{sanitize_name(endpoint['name'])}"
     if find_sink_by_name(sink_name) is None:
-        module_id = load_tunnel_sink(endpoint, fmt, rate, channels)
+        module_id = load_tunnel_sink(endpoint, fmt, rate, channels, latency_ms)
         cfg["module_id"] = module_id
     cfg["default_endpoint"] = endpoint
     if fmt:
@@ -220,6 +235,8 @@ def cmd_connect(target: Optional[str], fmt: Optional[str], rate: Optional[int], 
         cfg["rate"] = rate
     if channels:
         cfg["channels"] = channels
+    if latency_ms:
+        cfg["latency_ms"] = latency_ms
     save_config(cfg)
 
     set_default_sink(sink_name)
@@ -292,6 +309,7 @@ def main() -> int:
     p_connect.add_argument("--format", help="Sample format, e.g. s24le, s24_32le, s32le, float32le")
     p_connect.add_argument("--rate", type=int, help="Sample rate, e.g. 96000")
     p_connect.add_argument("--channels", type=int, help="Channel count, e.g. 2")
+    p_connect.add_argument("--latency-ms", type=int, help="Target latency in ms, e.g. 200")
     sub.add_parser("disconnect", help="Disconnect from remote sink")
     sub.add_parser("status", help="Show current default sink")
     sub.add_parser("selftest", help="Check required tools")
@@ -301,7 +319,7 @@ def main() -> int:
         if args.cmd == "list":
             return cmd_list()
         if args.cmd == "connect":
-            return cmd_connect(args.target, args.format, args.rate, args.channels)
+            return cmd_connect(args.target, args.format, args.rate, args.channels, args.latency_ms)
         if args.cmd == "disconnect":
             return cmd_disconnect()
         if args.cmd == "status":

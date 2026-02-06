@@ -14,7 +14,7 @@
         in {
           pwlink = pkgs.stdenvNoCC.mkDerivation {
             pname = "pwlink";
-            version = "0.1.3";
+            version = "0.1.4";
             src = self;
             nativeBuildInputs = [ pkgs.makeWrapper ];
             dontBuild = true;

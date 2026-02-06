@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import time
 import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
@@ -167,6 +168,15 @@ def find_sink_by_name(name: str) -> Optional[str]:
     return None
 
 
+def wait_for_sink(name: str, timeout_sec: float = 2.0) -> bool:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if find_sink_by_name(name):
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def get_default_sink_name() -> Optional[str]:
     require_tool("pactl")
     out = run(["pactl", "info"], check=False)
@@ -213,6 +223,10 @@ def cmd_connect(target: Optional[str], fmt: Optional[str], rate: Optional[int], 
     if find_sink_by_name(sink_name) is None:
         module_id = load_tunnel_sink(endpoint, fmt, rate, channels)
         cfg["module_id"] = module_id
+        if not wait_for_sink(sink_name):
+            # Clean up module if sink didn't appear
+            run(["pactl", "unload-module", str(module_id)], check=False)
+            raise RuntimeError("Tunnel sink did not appear (connection/auth failure?)")
     cfg["default_endpoint"] = endpoint
     if fmt:
         cfg["format"] = fmt

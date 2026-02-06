@@ -16,6 +16,7 @@ Simple CLI to route local audio to a remote PipeWire-Pulse server over TCP. Uses
 ./pwlink connect pipe             # Try pipe.local:4713
 ./pwlink connect pipe             # Also tries Tailscale hostname if available
 ./pwlink connect pipe --rate 96000 --format s24_32le --channels 2
+./pwlink connect pipe --latency-ms 200
 ./pwlink connect                  # Connect saved default
 ./pwlink status                   # Show current default sink
 ./pwlink disconnect               # Disconnect and return to local sink

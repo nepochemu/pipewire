@@ -1,52 +1,35 @@
-# airplay-cli
+# pwlink
 
-Provides a human‑friendly CLI to route AirPlay audio over Wi‑Fi to devices on PipeWire or PulseAudio. Existing tools
-  are too complex and unreliable for casual use, so this is a simpler, more stable alternative.
+Simple CLI to route local audio to a remote PipeWire-Pulse server over TCP. Uses mDNS discovery with a fallback to cached endpoints or manual host:port.
 
 ## Requirements
 
-- PipeWire: `pipewire` (for `pw-dump`) and `wireplumber` (for `wpctl`)
-- PulseAudio: `pulseaudio` (for `pactl`)
-- `pulseaudio` is also used on PipeWire to move existing streams and load RAOP discovery
-- Avahi running so RAOP devices are discoverable
+- `pactl` (PipeWire-Pulse)
+- `avahi-browse` (mDNS discovery)
 
 ## Usage
 
 ```bash
-./airplay list                    # List AirPlay sinks
-./airplay list --ensure           # Load RAOP discovery then list
-./airplay list --all              # List AirPlay + non-AirPlay sinks
-./airplay connect "Living Room"   # Connect by name
-./airplay connect 52              # Connect by id
-./airplay connect                 # Connect saved default
-./airplay status                  # Show current default sink
-./airplay disconnect              # Switch back to non-AirPlay sink
-./airplay ensure-raop             # Load module-raop-discover
-./airplay selftest                # Check dependencies/connectivity
-./airplay diagnose                # Detailed diagnostics
-./airplay check                   # Test TCP reachability to sinks
-./airplay version                 # Show version and git rev
-./airplay install-autostart       # Install autoconnect user service
-./airplay uninstall-autostart     # Remove autoconnect user service
-./airplay reset                   # Restart audio services + reload RAOP
+./pwlink list                     # List discovered endpoints
+./pwlink connect "Living Room"    # Connect by name
+./pwlink connect 192.168.1.10:4713 # Connect by host:port
+./pwlink connect                  # Connect saved default
+./pwlink status                   # Show current default sink
+./pwlink disconnect               # Disconnect and return to local sink
+./pwlink selftest                 # Check required tools
 ```
 
-## Nix Setup
+## Receiver (Raspberry Pi OS)
 
-See `NIX_README.md` for Nix installation, Home Manager autostart, and NixOS setup.
-
-## Help
+On the receiver, enable PipeWire-Pulse TCP server and mDNS. Example commands:
 
 ```bash
-./airplay --help
-./airplay list --help
-./airplay connect --help
+# Enable TCP protocol (allow from LAN only)
+pactl load-module module-native-protocol-tcp auth-anonymous=1
+
+# Ensure avahi is running so the service is discoverable
+systemctl --user status pipewire-pulse
+systemctl status avahi-daemon
 ```
 
-## Notes
-
-- `connect` sets the default sink via `wpctl`. Existing streams move automatically only if `pactl` is available.
-- Saved default now follows the sink name (stable) instead of numeric id.
-- `ensure-raop` loads `module-raop-discover`, which exposes AirPlay devices as sinks.
-- `selftest` checks for required tools and basic PipeWire/WirePlumber connectivity.
-- `diagnose` prints detailed service and RAOP discovery info.
+If you want this permanent on the receiver, configure PipeWire-Pulse to load `module-native-protocol-tcp` on startup.

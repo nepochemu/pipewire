@@ -1,5 +1,5 @@
 {
-  description = "airplay-cli";
+  description = "pwlink";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
 
@@ -12,34 +12,29 @@
         let
           pkgs = import nixpkgs { inherit system; };
         in {
-          airplay = pkgs.stdenvNoCC.mkDerivation {
-            pname = "airplay-cli";
-            version = "0.2.0";
+          pwlink = pkgs.stdenvNoCC.mkDerivation {
+            pname = "pwlink";
+            version = "0.1.0";
             src = self;
             nativeBuildInputs = [ pkgs.makeWrapper ];
             dontBuild = true;
             installPhase = ''
               mkdir -p $out/bin
-              install -m755 $src/airplay $out/bin/airplay
-              wrapProgram $out/bin/airplay \
-                --set AIRPLAY_VERSION ${"0.2.0"} \
-                --set AIRPLAY_REV ${self.rev or "dirty"} \
-                --prefix PATH : ${pkgs.python3}/bin \
-                --prefix PATH : ${pkgs.pipewire}/bin \
-                --prefix PATH : ${pkgs.wireplumber}/bin \
+              install -m755 $src/pwlink $out/bin/pwlink
+              wrapProgram $out/bin/pwlink \
                 --prefix PATH : ${pkgs.pulseaudio}/bin \
                 --prefix PATH : ${pkgs.avahi}/bin
             '';
           };
-          default = self.packages.${system}.airplay;
+          default = self.packages.${system}.pwlink;
         });
 
       apps = forAllSystems (system: {
-        airplay = {
+        pwlink = {
           type = "app";
-          program = "${self.packages.${system}.airplay}/bin/airplay";
+          program = "${self.packages.${system}.pwlink}/bin/pwlink";
         };
-        default = self.apps.${system}.airplay;
+        default = self.apps.${system}.pwlink;
       });
 
       devShells = forAllSystems (system:
@@ -49,8 +44,6 @@
           default = pkgs.mkShell {
             packages = with pkgs; [
               python3
-              pipewire
-              wireplumber
               pulseaudio
               avahi
             ];

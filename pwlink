@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def run(cmd: List[str], check: bool = True) -> str:
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+        return out
+    except subprocess.CalledProcessError as e:
+        if check:
+            raise RuntimeError(e.output.strip())
+        return e.output
+
+
+def require_tool(name: str) -> None:
+    if shutil.which(name) is None:
+        raise RuntimeError(f"Missing required tool: {name}")
+
+
+def config_path() -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "pwlink", "config.json")
+
+
+def load_config() -> Dict[str, Any]:
+    path = config_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_config(cfg: Dict[str, Any]) -> None:
+    path = config_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def sanitize_name(name: str) -> str:
+    name = name.lower()
+    name = re.sub(r"[^a-z0-9_-]+", "_", name)
+    return name.strip("_") or "remote"
+
+
+def discover_mdns() -> List[Dict[str, str]]:
+    # Try common service types for Pulse/pipewire-pulse
+    services = ["_pulse._tcp", "_pulse-native._tcp"]
+    if shutil.which("avahi-browse") is None:
+        return []
+    found: Dict[str, Dict[str, str]] = {}
+    for svc in services:
+        out = run(["avahi-browse", "-rt", svc], check=False)
+        for line in out.splitlines():
+            # Example: =;eth0;IPv4;hostname;_pulse._tcp;local;hostname.local;4713;""
+            if not line or line.startswith("+") or line.startswith("=") is False:
+                continue
+            parts = line.split(";")
+            if len(parts) < 9:
+                continue
+            name = parts[3]
+            host = parts[6]
+            port = parts[8]
+            if not name or not host or not port:
+                continue
+            found[name] = {"name": name, "host": host, "port": port}
+    return list(found.values())
+
+
+def list_endpoints() -> List[Dict[str, str]]:
+    eps = discover_mdns()
+    cfg = load_config()
+    cached = cfg.get("cached_endpoints") or []
+    # Merge, prefer mDNS
+    by_name = {e["name"]: e for e in cached if isinstance(e, dict)}
+    for e in eps:
+        by_name[e["name"]] = e
+    merged = list(by_name.values())
+    cfg["cached_endpoints"] = merged
+    save_config(cfg)
+    return merged
+
+
+def find_endpoint(query: str, endpoints: List[Dict[str, str]]) -> Dict[str, str]:
+    # Direct host:port
+    if ":" in query and re.match(r"^[^:]+:\d+$", query):
+        host, port = query.split(":", 1)
+        return {"name": host, "host": host, "port": port}
+
+    q = query.lower()
+    matches = [e for e in endpoints if q in e["name"].lower()]
+    if not matches:
+        raise RuntimeError(f"No endpoint matching '{query}'")
+    if len(matches) > 1:
+        lines = ["Multiple matches:"]
+        for e in matches:
+            lines.append(f"  {e['name']} -> {e['host']}:{e['port']}")
+        raise RuntimeError("\n".join(lines))
+    return matches[0]
+
+
+def pactl_list_modules() -> str:
+    require_tool("pactl")
+    return run(["pactl", "list", "modules"], check=False)
+
+
+def load_tunnel_sink(endpoint: Dict[str, str]) -> int:
+    require_tool("pactl")
+    sink_name = f"pwlink_{sanitize_name(endpoint['name'])}"
+    args = [
+        "pactl",
+        "load-module",
+        "module-tunnel-sink",
+        f"server={endpoint['host']}:{endpoint['port']}",
+        f"sink_name={sink_name}",
+    ]
+    out = run(args)
+    try:
+        return int(out.strip())
+    except ValueError:
+        raise RuntimeError(f"Unexpected pactl output: {out.strip()}")
+
+
+def set_default_sink(sink_name: str) -> None:
+    require_tool("pactl")
+    run(["pactl", "set-default-sink", sink_name])
+
+
+def move_streams(sink_name: str) -> None:
+    require_tool("pactl")
+    inputs = run(["pactl", "list", "short", "sink-inputs"], check=False)
+    for line in inputs.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        idx = parts[0]
+        run(["pactl", "move-sink-input", idx, sink_name], check=False)
+
+
+def find_sink_by_name(name: str) -> Optional[str]:
+    require_tool("pactl")
+    out = run(["pactl", "list", "short", "sinks"], check=False)
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == name:
+            return parts[1]
+    return None
+
+
+def get_default_sink_name() -> Optional[str]:
+    require_tool("pactl")
+    out = run(["pactl", "info"], check=False)
+    for line in out.splitlines():
+        if line.startswith("Default Sink:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def cmd_list() -> int:
+    eps = list_endpoints()
+    if not eps:
+        print("No endpoints found (mDNS empty).")
+        return 1
+    print("Endpoints:")
+    for e in eps:
+        print(f"  {e['name']} -> {e['host']}:{e['port']}")
+    return 0
+
+
+def cmd_connect(target: Optional[str]) -> int:
+    require_tool("pactl")
+    eps = list_endpoints()
+    cfg = load_config()
+
+    if target is None:
+        saved = cfg.get("default_endpoint")
+        if saved:
+            endpoint = saved
+        elif eps:
+            endpoint = eps[0]
+        else:
+            raise RuntimeError("No endpoints found")
+    else:
+        endpoint = find_endpoint(target, eps)
+
+    # If module already loaded, reuse
+    sink_name = f"pwlink_{sanitize_name(endpoint['name'])}"
+    if find_sink_by_name(sink_name) is None:
+        module_id = load_tunnel_sink(endpoint)
+        cfg["module_id"] = module_id
+    cfg["default_endpoint"] = endpoint
+    save_config(cfg)
+
+    set_default_sink(sink_name)
+    move_streams(sink_name)
+    print(f"Connected: {endpoint['name']} -> {endpoint['host']}:{endpoint['port']}")
+    return 0
+
+
+def cmd_disconnect() -> int:
+    require_tool("pactl")
+    cfg = load_config()
+    module_id = cfg.get("module_id")
+
+    # pick a non-tunnel sink
+    out = run(["pactl", "list", "short", "sinks"], check=False)
+    target = None
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        name = parts[1]
+        if not name.startswith("pwlink_"):
+            target = name
+            break
+    if target:
+        set_default_sink(target)
+        move_streams(target)
+
+    if module_id:
+        run(["pactl", "unload-module", str(module_id)], check=False)
+
+    print("Disconnected")
+    return 0
+
+
+def cmd_status() -> int:
+    require_tool("pactl")
+    default = get_default_sink_name()
+    if not default:
+        print("Default sink: unknown")
+        return 1
+    print(f"Default sink: {default}")
+    return 0
+
+
+def cmd_selftest() -> int:
+    problems: List[str] = []
+    for tool in ("pactl", "avahi-browse"):
+        if shutil.which(tool) is None:
+            problems.append(f"missing tool: {tool}")
+    if problems:
+        print("Self-test failed:")
+        for p in problems:
+            print(f"  - {p}")
+        return 2
+    print("Self-test passed.")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="pwlink",
+        description="Route PipeWire/PulseAudio to a remote PipeWire-Pulse server",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("list", help="List mDNS endpoints")
+    p_connect = sub.add_parser("connect", help="Connect to endpoint by name or host:port")
+    p_connect.add_argument("target", nargs="?", help="Endpoint name or host:port")
+    sub.add_parser("disconnect", help="Disconnect from remote sink")
+    sub.add_parser("status", help="Show current default sink")
+    sub.add_parser("selftest", help="Check required tools")
+
+    args = parser.parse_args()
+    try:
+        if args.cmd == "list":
+            return cmd_list()
+        if args.cmd == "connect":
+            return cmd_connect(args.target)
+        if args.cmd == "disconnect":
+            return cmd_disconnect()
+        if args.cmd == "status":
+            return cmd_status()
+        if args.cmd == "selftest":
+            return cmd_selftest()
+        parser.error("unknown command")
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -244,9 +244,6 @@ def cmd_connect(target: Optional[str], fmt: Optional[str], rate: Optional[int], 
 
 def cmd_disconnect() -> int:
     require_tool("pactl")
-    cfg = load_config()
-    module_id = cfg.get("module_id")
-
     # pick a non-tunnel sink
     out = run(["pactl", "list", "short", "sinks"], check=False)
     target = None
@@ -262,8 +259,16 @@ def cmd_disconnect() -> int:
         set_default_sink(target)
         move_streams(target)
 
-    if module_id:
-        run(["pactl", "unload-module", str(module_id)], check=False)
+    # unload any tunnel sink modules
+    mods = run(["pactl", "list", "short", "modules"], check=False)
+    for line in mods.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        mid = parts[0]
+        mname = parts[1]
+        if mname == "module-tunnel-sink":
+            run(["pactl", "unload-module", mid], check=False)
 
     print("Disconnected")
     return 0
@@ -277,6 +282,12 @@ def cmd_status() -> int:
         return 1
     print(f"Default sink: {default}")
     return 0
+
+
+def cmd_reset() -> int:
+    # Full sender-side reset: unload tunnel modules and reconnect saved/default.
+    cmd_disconnect()
+    return cmd_connect(None, None, None, None)
 
 
 def cmd_selftest() -> int:
@@ -308,6 +319,7 @@ def main() -> int:
     p_connect.add_argument("--channels", type=int, help="Channel count, e.g. 2")
     sub.add_parser("disconnect", help="Disconnect from remote sink")
     sub.add_parser("status", help="Show current default sink")
+    sub.add_parser("reset", help="Reset tunnels and reconnect")
     sub.add_parser("selftest", help="Check required tools")
 
     args = parser.parse_args()
@@ -320,6 +332,8 @@ def main() -> int:
             return cmd_disconnect()
         if args.cmd == "status":
             return cmd_status()
+        if args.cmd == "reset":
+            return cmd_reset()
         if args.cmd == "selftest":
             return cmd_selftest()
         parser.error("unknown command")

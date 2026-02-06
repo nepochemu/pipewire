@@ -18,6 +18,7 @@ Simple CLI to route local audio to a remote PipeWire-Pulse server over TCP. Uses
 ./pwlink connect                  # Connect saved default
 ./pwlink status                   # Show current default sink
 ./pwlink disconnect               # Disconnect and return to local sink
+./pwlink reset                    # Reset tunnels and reconnect
 ./pwlink selftest                 # Check required tools
 ```
 

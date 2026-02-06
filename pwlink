@@ -263,6 +263,8 @@ def cmd_connect(
             # Clean up module if sink didn't appear
             run(["pactl", "unload-module", str(module_id)], check=False)
             raise RuntimeError("Tunnel sink did not appear (connection/auth failure?)")
+    else:
+        print("Connection already established.")
     cfg["default_endpoint"] = endpoint
     if fmt:
         cfg["format"] = fmt

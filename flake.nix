@@ -14,7 +14,7 @@
         in {
           pwlink = pkgs.stdenvNoCC.mkDerivation {
             pname = "pwlink";
-            version = "0.1.0";
+            version = "0.1.1";
             src = self;
             nativeBuildInputs = [ pkgs.makeWrapper ];
             dontBuild = true;
@@ -22,6 +22,7 @@
               mkdir -p $out/bin
               install -m755 $src/pwlink $out/bin/pwlink
               wrapProgram $out/bin/pwlink \
+                --prefix PATH : ${pkgs.python3}/bin \
                 --prefix PATH : ${pkgs.pulseaudio}/bin \
                 --prefix PATH : ${pkgs.avahi}/bin
             '';

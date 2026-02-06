@@ -97,6 +97,10 @@ def find_endpoint(query: str, endpoints: List[Dict[str, str]]) -> Dict[str, str]
         host, port = query.split(":", 1)
         return {"name": host, "host": host, "port": port}
 
+    # Try mDNS-style hostname fallback
+    if "." not in query:
+        return {"name": query, "host": f"{query}.local", "port": "4713"}
+
     q = query.lower()
     matches = [e for e in endpoints if q in e["name"].lower()]
     if not matches:

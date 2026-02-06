@@ -13,6 +13,7 @@ Simple CLI to route local audio to a remote PipeWire-Pulse server over TCP. Uses
 ./pwlink list                     # List discovered endpoints
 ./pwlink connect "Living Room"    # Connect by name
 ./pwlink connect 192.168.1.10:4713 # Connect by host:port
+./pwlink connect pipe             # Try pipe.local:4713
 ./pwlink connect                  # Connect saved default
 ./pwlink status                   # Show current default sink
 ./pwlink disconnect               # Disconnect and return to local sink

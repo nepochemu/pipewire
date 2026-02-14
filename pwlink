@@ -9,6 +9,13 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
+SAFE_START_VOLUME_PERCENT = 2
+SAFE_RAMP_TARGET_PERCENT = 100
+SAFE_RAMP_STEPS = 16
+SAFE_RAMP_STEP_DELAY_SEC = 0.03
+SAFE_DISCONNECT_STEP_DELAY_SEC = 0.02
+SAFE_TUNNEL_APPEAR_TIMEOUT_SEC = 8.0
+
 
 def run(cmd: List[str], check: bool = True) -> str:
     try:
@@ -176,6 +183,35 @@ def set_default_sink(sink_name: str) -> None:
     run(["pactl", "set-default-sink", sink_name])
 
 
+def set_sink_mute(sink_name: str, muted: bool) -> None:
+    require_tool("pactl")
+    run(["pactl", "set-sink-mute", sink_name, "1" if muted else "0"], check=False)
+
+
+def set_sink_volume_percent(sink_name: str, percent: int) -> None:
+    require_tool("pactl")
+    pct = max(0, min(150, int(percent)))
+    run(["pactl", "set-sink-volume", sink_name, f"{pct}%"], check=False)
+
+
+def ramp_sink_volume(
+    sink_name: str,
+    start_percent: int,
+    end_percent: int,
+    steps: int,
+    step_delay_sec: float,
+) -> None:
+    require_tool("pactl")
+    steps = max(1, steps)
+    start = int(start_percent)
+    end = int(end_percent)
+    for i in range(steps + 1):
+        # Linear ramp to prevent pops/transients at connect/disconnect boundaries.
+        p = round(start + (end - start) * (i / steps))
+        set_sink_volume_percent(sink_name, p)
+        time.sleep(max(0.0, step_delay_sec))
+
+
 def move_streams(sink_name: str) -> None:
     require_tool("pactl")
     inputs = run(["pactl", "list", "short", "sink-inputs"], check=False)
@@ -197,7 +233,7 @@ def find_sink_by_name(name: str) -> Optional[str]:
     return None
 
 
-def wait_for_sink(name: str, timeout_sec: float = 2.0) -> bool:
+def wait_for_sink(name: str, timeout_sec: float = SAFE_TUNNEL_APPEAR_TIMEOUT_SEC) -> bool:
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         if find_sink_by_name(name):
@@ -262,7 +298,11 @@ def cmd_connect(
         if not wait_for_sink(sink_name):
             # Clean up module if sink didn't appear
             run(["pactl", "unload-module", str(module_id)], check=False)
-            raise RuntimeError("Tunnel sink did not appear (connection/auth failure?)")
+            raise RuntimeError(
+                "Tunnel sink did not appear within timeout "
+                f"({SAFE_TUNNEL_APPEAR_TIMEOUT_SEC:.0f}s). "
+                "Receiver may be slow/offline or refused the tunnel."
+            )
     else:
         print("Connection already established.")
     cfg["default_endpoint"] = endpoint
@@ -276,14 +316,39 @@ def cmd_connect(
         cfg["latency_ms"] = latency_ms
     save_config(cfg)
 
+    # Soft-start the remote sink to prevent speaker spikes.
+    set_sink_mute(sink_name, True)
+    set_sink_volume_percent(sink_name, SAFE_START_VOLUME_PERCENT)
     set_default_sink(sink_name)
     move_streams(sink_name)
+    time.sleep(0.12)
+    set_sink_mute(sink_name, False)
+    ramp_sink_volume(
+        sink_name,
+        SAFE_START_VOLUME_PERCENT,
+        SAFE_RAMP_TARGET_PERCENT,
+        SAFE_RAMP_STEPS,
+        SAFE_RAMP_STEP_DELAY_SEC,
+    )
     print(f"Connected: {endpoint['name']} -> {endpoint['host']}:{endpoint['port']}")
     return 0
 
 
 def cmd_disconnect() -> int:
     require_tool("pactl")
+    current_default = get_default_sink_name() or ""
+    if current_default.startswith("pwlink_"):
+        # Soft-stop before switching away/unloading to avoid turn-off pops.
+        ramp_sink_volume(
+            current_default,
+            SAFE_RAMP_TARGET_PERCENT,
+            SAFE_START_VOLUME_PERCENT,
+            SAFE_RAMP_STEPS,
+            SAFE_DISCONNECT_STEP_DELAY_SEC,
+        )
+        set_sink_mute(current_default, True)
+        time.sleep(0.08)
+
     # pick a non-tunnel sink
     out = run(["pactl", "list", "short", "sinks"], check=False)
     target = None
@@ -327,7 +392,7 @@ def cmd_status() -> int:
 def cmd_reset() -> int:
     # Full sender-side reset: unload tunnel modules and reconnect saved/default.
     cmd_disconnect()
-    return cmd_connect(None, None, None, None)
+    return cmd_connect(None, None, None, None, None)
 
 
 def cmd_selftest() -> int:

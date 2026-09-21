@@ -1,2 +1,9 @@
 .DS_Store
 *.swp
+
+# Local install/debug notes — these have carried plaintext credentials before.
+*INSTALL_NOTES.md
+
+# Python bytecode
+__pycache__/
+*.pyc

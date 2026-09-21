@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import time
 import subprocess
 import sys
@@ -15,6 +16,10 @@ SAFE_RAMP_STEPS = 16
 SAFE_RAMP_STEP_DELAY_SEC = 0.03
 SAFE_DISCONNECT_STEP_DELAY_SEC = 0.02
 SAFE_TUNNEL_APPEAR_TIMEOUT_SEC = 8.0
+LAN_PROBE_TIMEOUT_SEC = 0.6
+WATCH_POLL_INTERVAL_SEC = 3.0
+WATCH_BACKOFF_START_SEC = 1.0
+WATCH_BACKOFF_MAX_SEC = 30.0
 
 
 def run(cmd: List[str], check: bool = True) -> str:
@@ -99,6 +104,32 @@ def list_endpoints() -> List[Dict[str, str]]:
     return merged
 
 
+def resolve_mdns_ip(host: str) -> Optional[str]:
+    """Resolve a .local name to an IPv4 address via avahi.
+
+    nss-mdns is not wired into the resolver here (getent hosts pipe.local
+    fails), so getaddrinfo cannot turn a .local name into an address and
+    neither can module-tunnel-sink. Ask avahi directly and hand the tunnel
+    a literal IP.
+    """
+    if shutil.which("avahi-resolve") is None:
+        return None
+    out = run(["avahi-resolve", "-4", "-n", host], check=False)
+    parts = out.split()
+    if len(parts) >= 2 and parts[1].count(".") == 3:
+        return parts[1]
+    return None
+
+
+def host_reachable(host: str, port: str, timeout: float = LAN_PROBE_TIMEOUT_SEC) -> bool:
+    """Best-effort TCP probe used to tell a live LAN path from a dead one."""
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except (OSError, ValueError, OverflowError):
+        return False
+
+
 def resolve_tailscale_host(name: str) -> Optional[str]:
     if shutil.which("tailscale") is None:
         return None
@@ -115,31 +146,59 @@ def resolve_tailscale_host(name: str) -> Optional[str]:
     return None
 
 
+def lan_candidate(endpoint: Dict[str, str]) -> Optional[Dict[str, str]]:
+    """Return endpoint with host pinned to a reachable LAN IP, else None."""
+    host = endpoint["host"]
+    port = endpoint["port"]
+    if host.endswith(".local"):
+        ip = resolve_mdns_ip(host)
+        if ip is None:
+            return None
+        host = ip
+    if not host_reachable(host, port):
+        return None
+    return {"name": endpoint["name"], "host": host, "port": port}
+
+
 def find_endpoint(query: str, endpoints: List[Dict[str, str]]) -> Dict[str, str]:
-    # Direct host:port
+    # Direct host:port always wins; the user asked for a specific path.
     if ":" in query and re.match(r"^[^:]+:\d+$", query):
         host, port = query.split(":", 1)
         return {"name": host, "host": host, "port": port}
 
-    # Try Tailscale hostname fallback
-    ts_ip = resolve_tailscale_host(query)
-    if ts_ip:
-        return {"name": query, "host": ts_ip, "port": "4713"}
-
-    # Try mDNS-style hostname fallback
-    if "." not in query:
-        return {"name": query, "host": f"{query}.local", "port": "4713"}
-
     q = query.lower()
     matches = [e for e in endpoints if q in e["name"].lower()]
-    if not matches:
-        raise RuntimeError(f"No endpoint matching '{query}'")
     if len(matches) > 1:
         lines = ["Multiple matches:"]
         for e in matches:
             lines.append(f"  {e['name']} -> {e['host']}:{e['port']}")
         raise RuntimeError("\n".join(lines))
-    return matches[0]
+
+    # Prefer a LAN path over Tailscale. Tailscale can route same-room traffic
+    # through a DERP relay (observed: a relay in Frankfurt for a host one room
+    # away), which flaps and kills the tunnel. Only fall back to it when the
+    # host genuinely is not reachable on the local network.
+    candidates = list(matches)
+    if "." not in query:
+        candidates.append({"name": query, "host": f"{query}.local", "port": "4713"})
+
+    seen = set()
+    for cand in candidates:
+        key = (cand["host"], cand["port"])
+        if key in seen:
+            continue
+        seen.add(key)
+        lan = lan_candidate(cand)
+        if lan:
+            return lan
+
+    ts_ip = resolve_tailscale_host(query)
+    if ts_ip:
+        return {"name": query, "host": ts_ip, "port": "4713"}
+
+    if matches:
+        return matches[0]
+    raise RuntimeError(f"No endpoint matching '{query}'")
 
 
 def pactl_list_modules() -> str:
@@ -268,21 +327,11 @@ def cmd_connect(
     rate: Optional[int],
     channels: Optional[int],
     latency_ms: Optional[int],
+    watch: bool = False,
 ) -> int:
     require_tool("pactl")
-    eps = list_endpoints()
     cfg = load_config()
-
-    if target is None:
-        saved = cfg.get("default_endpoint")
-        if saved:
-            endpoint = saved
-        elif eps:
-            endpoint = eps[0]
-        else:
-            raise RuntimeError("No endpoints found")
-    else:
-        endpoint = find_endpoint(target, eps)
+    endpoint = resolve_target(target, cfg)
 
     # If module already loaded, reuse
     # Merge format prefs: CLI overrides config
@@ -291,20 +340,7 @@ def cmd_connect(
     channels = channels or cfg.get("channels")
     latency_ms = latency_ms or cfg.get("latency_ms")
 
-    sink_name = f"pwlink_{sanitize_name(endpoint['name'])}"
-    if find_sink_by_name(sink_name) is None:
-        module_id = load_tunnel_sink(endpoint, fmt, rate, channels, latency_ms)
-        cfg["module_id"] = module_id
-        if not wait_for_sink(sink_name):
-            # Clean up module if sink didn't appear
-            run(["pactl", "unload-module", str(module_id)], check=False)
-            raise RuntimeError(
-                "Tunnel sink did not appear within timeout "
-                f"({SAFE_TUNNEL_APPEAR_TIMEOUT_SEC:.0f}s). "
-                "Receiver may be slow/offline or refused the tunnel."
-            )
-    else:
-        print("Connection already established.")
+    sink_name = establish_tunnel(endpoint, fmt, rate, channels, latency_ms, cfg)
     cfg["default_endpoint"] = endpoint
     if fmt:
         cfg["format"] = fmt
@@ -331,7 +367,156 @@ def cmd_connect(
         SAFE_RAMP_STEP_DELAY_SEC,
     )
     print(f"Connected: {endpoint['name']} -> {endpoint['host']}:{endpoint['port']}")
+    if watch:
+        return watch_loop(endpoint, fmt, rate, channels, latency_ms)
     return 0
+
+
+def resolve_target(
+    target: Optional[str], cfg: Dict[str, Any]
+) -> Dict[str, str]:
+    """Pick the endpoint to connect to, re-running discovery each time.
+
+    Re-resolving on every attempt is deliberate: it lets a reconnect move back
+    onto the LAN as soon as the LAN path returns, instead of pinning whatever
+    path happened to work first.
+    """
+    eps = list_endpoints()
+    if target is None:
+        saved = cfg.get("default_endpoint")
+        if saved:
+            # Re-resolve by name so a stale saved host (e.g. a VPN address
+            # recorded before the LAN path existed) cannot pin us to it.
+            name = saved.get("name")
+            if name:
+                try:
+                    return find_endpoint(name, eps)
+                except RuntimeError:
+                    return saved
+            return saved
+        if eps:
+            return eps[0]
+        raise RuntimeError("No endpoints found")
+    return find_endpoint(target, eps)
+
+
+def establish_tunnel(
+    endpoint: Dict[str, str],
+    fmt: Optional[str],
+    rate: Optional[int],
+    channels: Optional[int],
+    latency_ms: Optional[int],
+    cfg: Dict[str, Any],
+    quiet: bool = False,
+) -> str:
+    """Load the tunnel module if the sink is absent. Returns the sink name."""
+    sink_name = f"pwlink_{sanitize_name(endpoint['name'])}"
+    if find_sink_by_name(sink_name) is None:
+        module_id = load_tunnel_sink(endpoint, fmt, rate, channels, latency_ms)
+        cfg["module_id"] = module_id
+        if not wait_for_sink(sink_name):
+            # Clean up module if sink didn't appear
+            run(["pactl", "unload-module", str(module_id)], check=False)
+            raise RuntimeError(
+                "Tunnel sink did not appear within timeout "
+                f"({SAFE_TUNNEL_APPEAR_TIMEOUT_SEC:.0f}s). "
+                "Receiver may be slow/offline or refused the tunnel."
+            )
+    elif not quiet:
+        print("Connection already established.")
+    return sink_name
+
+
+def drop_stale_module(cfg: Dict[str, Any]) -> None:
+    """Unload a tunnel module left behind by a dead connection."""
+    module_id = cfg.get("module_id")
+    if module_id is None:
+        return
+    run(["pactl", "unload-module", str(module_id)], check=False)
+    cfg["module_id"] = None
+
+
+def watch_loop(
+    endpoint: Dict[str, str],
+    fmt: Optional[str],
+    rate: Optional[int],
+    channels: Optional[int],
+    latency_ms: Optional[int],
+) -> int:
+    """Supervise the tunnel, reconnecting with backoff when the sink vanishes.
+
+    module-tunnel-sink does not retry: when the socket dies the sink simply
+    disappears and audio is gone until something reloads the module. This loop
+    is that something.
+    """
+    # Line-buffer so progress is visible when stdout is a pipe or a journal,
+    # not just a terminal.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, OSError):
+        pass
+    sink_name = f"pwlink_{sanitize_name(endpoint['name'])}"
+    backoff = WATCH_BACKOFF_START_SEC
+    print(f"Watching {sink_name} (Ctrl-C to stop).")
+    try:
+        while True:
+            time.sleep(WATCH_POLL_INTERVAL_SEC)
+            if find_sink_by_name(sink_name) is not None:
+                backoff = WATCH_BACKOFF_START_SEC
+                continue
+
+            print(f"Tunnel {sink_name} disappeared; reconnecting.")
+            cfg = load_config()
+            drop_stale_module(cfg)
+            try:
+                target = resolve_target(endpoint.get("name"), cfg)
+                sink_name = establish_tunnel(
+                    target, fmt, rate, channels, latency_ms, cfg, quiet=True
+                )
+                cfg["default_endpoint"] = target
+                save_config(cfg)
+                set_default_sink(sink_name)
+                move_streams(sink_name)
+                print(
+                    f"Reconnected: {target['name']} -> "
+                    f"{target['host']}:{target['port']}"
+                )
+                backoff = WATCH_BACKOFF_START_SEC
+            except RuntimeError as e:
+                save_config(cfg)
+                print(f"Reconnect failed ({e}); retrying in {backoff:.0f}s.")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, WATCH_BACKOFF_MAX_SEC)
+    except KeyboardInterrupt:
+        print("\nStopped watching.")
+        return 0
+
+
+def cmd_watch(target: Optional[str]) -> int:
+    require_tool("pactl")
+    cfg = load_config()
+    endpoint = resolve_target(target, cfg)
+    sink_name = establish_tunnel(
+        endpoint,
+        cfg.get("format"),
+        cfg.get("rate"),
+        cfg.get("channels"),
+        cfg.get("latency_ms"),
+        cfg,
+        quiet=True,
+    )
+    cfg["default_endpoint"] = endpoint
+    save_config(cfg)
+    set_default_sink(sink_name)
+    move_streams(sink_name)
+    print(f"Linked: {endpoint['name']} -> {endpoint['host']}:{endpoint['port']}")
+    return watch_loop(
+        endpoint,
+        cfg.get("format"),
+        cfg.get("rate"),
+        cfg.get("channels"),
+        cfg.get("latency_ms"),
+    )
 
 
 def cmd_disconnect() -> int:
@@ -389,10 +574,10 @@ def cmd_status() -> int:
     return 0
 
 
-def cmd_reset() -> int:
+def cmd_reset(watch: bool = False) -> int:
     # Full sender-side reset: unload tunnel modules and reconnect saved/default.
     cmd_disconnect()
-    return cmd_connect(None, None, None, None, None)
+    return cmd_connect(None, None, None, None, None, watch)
 
 
 def cmd_selftest() -> int:
@@ -423,9 +608,21 @@ def main() -> int:
     p_connect.add_argument("--rate", type=int, help="Sample rate, e.g. 96000")
     p_connect.add_argument("--channels", type=int, help="Channel count, e.g. 2")
     p_connect.add_argument("--latency-ms", type=int, help="Target latency in ms, e.g. 200")
+    p_connect.add_argument(
+        "--watch",
+        action="store_true",
+        help="Stay running and reconnect automatically if the tunnel drops",
+    )
     sub.add_parser("disconnect", help="Disconnect from remote sink")
     sub.add_parser("status", help="Show current default sink")
-    sub.add_parser("reset", help="Reset tunnels and reconnect")
+    p_watch = sub.add_parser("watch", help="Supervise the current link and auto-reconnect")
+    p_watch.add_argument("target", nargs="?", help="Endpoint name or host:port")
+    p_reset = sub.add_parser("reset", help="Reset tunnels and reconnect")
+    p_reset.add_argument(
+        "--watch",
+        action="store_true",
+        help="Stay running and reconnect automatically if the tunnel drops",
+    )
     sub.add_parser("selftest", help="Check required tools")
 
     args = parser.parse_args()
@@ -433,13 +630,17 @@ def main() -> int:
         if args.cmd == "list":
             return cmd_list()
         if args.cmd == "connect":
-            return cmd_connect(args.target, args.format, args.rate, args.channels, args.latency_ms)
+            return cmd_connect(
+                args.target, args.format, args.rate, args.channels, args.latency_ms, args.watch
+            )
+        if args.cmd == "watch":
+            return cmd_watch(args.target)
         if args.cmd == "disconnect":
             return cmd_disconnect()
         if args.cmd == "status":
             return cmd_status()
         if args.cmd == "reset":
-            return cmd_reset()
+            return cmd_reset(args.watch)
         if args.cmd == "selftest":
             return cmd_selftest()
         parser.error("unknown command")

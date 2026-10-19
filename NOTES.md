@@ -26,7 +26,7 @@
 ## Key Behavior
 - `Connection refused` means TCP 4713 is not listening on receiver.
 - If mDNS is empty, manual `host:port` works.
-- After receiver restarts, run `pwlink connect` again on sender.
+- After receiver restarts or sender suspend, the `pwlink watch` service reconnects; without it, run `pwlink connect` again.
 - Quiet playback can be stream attenuation: check `pactl list sink-inputs` on receiver and set sink-input volume to `100%`.
 
 ## Next Troubleshooting Steps (Sender, Low-Risk)

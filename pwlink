@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -310,6 +311,23 @@ def get_default_sink_name() -> Optional[str]:
     return None
 
 
+def soft_start(sink_name: str) -> None:
+    """Make sink_name the default and fade it in, to prevent speaker spikes."""
+    set_sink_mute(sink_name, True)
+    set_sink_volume_percent(sink_name, SAFE_START_VOLUME_PERCENT)
+    set_default_sink(sink_name)
+    move_streams(sink_name)
+    time.sleep(0.12)
+    set_sink_mute(sink_name, False)
+    ramp_sink_volume(
+        sink_name,
+        SAFE_START_VOLUME_PERCENT,
+        SAFE_RAMP_TARGET_PERCENT,
+        SAFE_RAMP_STEPS,
+        SAFE_RAMP_STEP_DELAY_SEC,
+    )
+
+
 def cmd_list() -> int:
     eps = list_endpoints()
     if not eps:
@@ -342,6 +360,7 @@ def cmd_connect(
 
     sink_name = establish_tunnel(endpoint, fmt, rate, channels, latency_ms, cfg)
     cfg["default_endpoint"] = endpoint
+    cfg["linked"] = True
     if fmt:
         cfg["format"] = fmt
     if rate:
@@ -352,23 +371,10 @@ def cmd_connect(
         cfg["latency_ms"] = latency_ms
     save_config(cfg)
 
-    # Soft-start the remote sink to prevent speaker spikes.
-    set_sink_mute(sink_name, True)
-    set_sink_volume_percent(sink_name, SAFE_START_VOLUME_PERCENT)
-    set_default_sink(sink_name)
-    move_streams(sink_name)
-    time.sleep(0.12)
-    set_sink_mute(sink_name, False)
-    ramp_sink_volume(
-        sink_name,
-        SAFE_START_VOLUME_PERCENT,
-        SAFE_RAMP_TARGET_PERCENT,
-        SAFE_RAMP_STEPS,
-        SAFE_RAMP_STEP_DELAY_SEC,
-    )
+    soft_start(sink_name)
     print(f"Connected: {endpoint['name']} -> {endpoint['host']}:{endpoint['port']}")
     if watch:
-        return watch_loop(endpoint, fmt, rate, channels, latency_ms)
+        return watch_loop(target)
     return 0
 
 
@@ -436,18 +442,33 @@ def drop_stale_module(cfg: Dict[str, Any]) -> None:
     cfg["module_id"] = None
 
 
-def watch_loop(
-    endpoint: Dict[str, str],
-    fmt: Optional[str],
-    rate: Optional[int],
-    channels: Optional[int],
-    latency_ms: Optional[int],
-) -> int:
+def acquire_watch_lock() -> Optional[Any]:
+    """Return a held lock file, or None if another watcher already runs.
+
+    Two watchers would both see the sink vanish and both load a tunnel.
+    """
+    base = os.environ.get("XDG_RUNTIME_DIR") or os.path.dirname(config_path())
+    os.makedirs(base, exist_ok=True)
+    f = open(os.path.join(base, "pwlink-watch.lock"), "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
+def watch_loop(target: Optional[str]) -> int:
     """Supervise the tunnel, reconnecting with backoff when the sink vanishes.
 
-    module-tunnel-sink does not retry: when the socket dies the sink simply
-    disappears and audio is gone until something reloads the module. This loop
-    is that something.
+    module-tunnel-sink does not retry: when the socket dies (e.g. the receiver
+    drops it while this machine is suspended) the sink simply disappears and
+    audio is gone until something reloads the module. This loop is that
+    something.
+
+    The config is re-read on every poll, so `pwlink disconnect` pauses the
+    watcher instead of being undone by it, and `pwlink connect <other>` moves
+    it to the new endpoint. An explicit target pins the endpoint instead.
     """
     # Line-buffer so progress is visible when stdout is a pipe or a journal,
     # not just a terminal.
@@ -455,36 +476,54 @@ def watch_loop(
         sys.stdout.reconfigure(line_buffering=True)
     except (AttributeError, OSError):
         pass
-    sink_name = f"pwlink_{sanitize_name(endpoint['name'])}"
+    lock = acquire_watch_lock()
+    if lock is None:
+        print("Another pwlink watcher is already running.")
+        return 0
     backoff = WATCH_BACKOFF_START_SEC
-    print(f"Watching {sink_name} (Ctrl-C to stop).")
+    # Endpoint name the sink is named after; for a pinned host:port target it
+    # is only known once resolved.
+    pinned_name: Optional[str] = None
+    print("Watching tunnel (Ctrl-C to stop).")
     try:
         while True:
-            time.sleep(WATCH_POLL_INTERVAL_SEC)
-            if find_sink_by_name(sink_name) is not None:
+            cfg = load_config()
+            saved = cfg.get("default_endpoint") or {}
+            name = pinned_name if target else saved.get("name")
+            if not cfg.get("linked", True) or not (target or name):
+                time.sleep(WATCH_POLL_INTERVAL_SEC)
+                continue
+            if name and find_sink_by_name(f"pwlink_{sanitize_name(name)}") is not None:
                 backoff = WATCH_BACKOFF_START_SEC
+                time.sleep(WATCH_POLL_INTERVAL_SEC)
                 continue
 
-            print(f"Tunnel {sink_name} disappeared; reconnecting.")
-            cfg = load_config()
+            print(f"Tunnel to {target or name} is down; connecting.")
             drop_stale_module(cfg)
             try:
-                target = resolve_target(endpoint.get("name"), cfg)
+                endpoint = resolve_target(target, cfg)
+                if target:
+                    pinned_name = endpoint["name"]
                 sink_name = establish_tunnel(
-                    target, fmt, rate, channels, latency_ms, cfg, quiet=True
+                    endpoint,
+                    cfg.get("format"),
+                    cfg.get("rate"),
+                    cfg.get("channels"),
+                    cfg.get("latency_ms"),
+                    cfg,
+                    quiet=True,
                 )
-                cfg["default_endpoint"] = target
+                cfg["default_endpoint"] = endpoint
                 save_config(cfg)
-                set_default_sink(sink_name)
-                move_streams(sink_name)
+                soft_start(sink_name)
                 print(
-                    f"Reconnected: {target['name']} -> "
-                    f"{target['host']}:{target['port']}"
+                    f"Connected: {endpoint['name']} -> "
+                    f"{endpoint['host']}:{endpoint['port']}"
                 )
                 backoff = WATCH_BACKOFF_START_SEC
             except RuntimeError as e:
                 save_config(cfg)
-                print(f"Reconnect failed ({e}); retrying in {backoff:.0f}s.")
+                print(f"Connect failed ({e}); retrying in {backoff:.0f}s.")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, WATCH_BACKOFF_MAX_SEC)
     except KeyboardInterrupt:
@@ -494,29 +533,12 @@ def watch_loop(
 
 def cmd_watch(target: Optional[str]) -> int:
     require_tool("pactl")
-    cfg = load_config()
-    endpoint = resolve_target(target, cfg)
-    sink_name = establish_tunnel(
-        endpoint,
-        cfg.get("format"),
-        cfg.get("rate"),
-        cfg.get("channels"),
-        cfg.get("latency_ms"),
-        cfg,
-        quiet=True,
-    )
-    cfg["default_endpoint"] = endpoint
-    save_config(cfg)
-    set_default_sink(sink_name)
-    move_streams(sink_name)
-    print(f"Linked: {endpoint['name']} -> {endpoint['host']}:{endpoint['port']}")
-    return watch_loop(
-        endpoint,
-        cfg.get("format"),
-        cfg.get("rate"),
-        cfg.get("channels"),
-        cfg.get("latency_ms"),
-    )
+    if target is not None:
+        # Naming a target is a request to link to it.
+        cfg = load_config()
+        cfg["linked"] = True
+        save_config(cfg)
+    return watch_loop(target)
 
 
 def cmd_disconnect() -> int:
@@ -559,6 +581,11 @@ def cmd_disconnect() -> int:
         mname = parts[1]
         if mname == "module-tunnel-sink":
             run(["pactl", "unload-module", mid], check=False)
+
+    cfg = load_config()
+    cfg["linked"] = False
+    cfg["module_id"] = None
+    save_config(cfg)
 
     print("Disconnected")
     return 0

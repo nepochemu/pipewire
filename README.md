@@ -21,8 +21,20 @@ Simple CLI to route local audio to a remote PipeWire-Pulse server over TCP. Uses
 ./pwlink status                   # Show current default sink
 ./pwlink disconnect               # Disconnect and return to local sink
 ./pwlink reset                    # Reset tunnels and reconnect
+./pwlink watch                    # Stay running; reconnect whenever the tunnel drops
 ./pwlink selftest                 # Check required tools
 ```
+
+## Staying connected
+
+`module-tunnel-sink` never retries: when the socket dies (the receiver drops it
+while the sender is suspended, or the receiver restarts) the sink vanishes and
+audio stays gone. `pwlink watch` reloads it with backoff. Run it as a systemd
+user service (`ExecStart=pwlink watch`, `Restart=always`) to stay connected
+across suspend and reboots. Only one watcher runs at a time.
+
+`pwlink disconnect` pauses the watcher rather than fighting it; `pwlink connect`
+resumes it, and a connect to a different endpoint moves the watcher there.
 
 ## Receiver (Raspberry Pi OS)
 
